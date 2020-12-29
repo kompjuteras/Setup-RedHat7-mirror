@@ -28,7 +28,7 @@
 
   tasks:
 
-    - name: Checj is system supported (Red Hat 7 only)
+    - name: Check is system supported (Red Hat 7 only)
       debug:
         msg: "{{ ansible_distribution }} {{ ansible_distribution_version }} is not supported OS for this play"
       failed_when: >
