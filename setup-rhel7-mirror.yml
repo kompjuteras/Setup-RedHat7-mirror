@@ -1,0 +1,188 @@
+- name: Install RedHat mirror on RHEL 7
+  hosts: all
+  become: yes
+  become_user: root
+  become_method: sudo
+  ignore_errors: false
+  any_errors_fatal: true
+
+  vars:
+    # Setup subscription pool(s) which you want to attach to your machine
+    redhat_pool_ids: [8a85f9997497a53e01749858fa711426, 8a85f99b68b93973016935a65b895a2b]
+
+    # Setup where you want to store downloaded rpms and all related to mirror. 
+    # Make sure you have minimum 300GB free on that path
+    mirror_install_path: "/apps"
+
+
+  vars_prompt:
+    - name: Username
+      prompt: Your Red Hat username
+      private: no
+    - name: Password
+      prompt: Your Red Hat password
+      private: yes
+
+  handlers:
+    - name: Apply new SELinux file context to repo path
+      command: restorecon -R {{ mirror_install_path }}/repo
+
+  tasks:
+
+    - name: Check is https://cdn.redhat.com visible from the server
+      shell: timeout 10 curl -I https://cdn.redhat.com --insecure &>/dev/null
+      changed_when: False
+
+    - name: Check does {{ mirror_install_path }} folder exists
+      stat:
+        path: '{{ mirror_install_path }}'
+      register: apps_folder_check
+      failed_when: ( not apps_folder_check.stat.exists ) or ( not apps_folder_check.stat.isdir )
+
+    - name: Check do we have 200GB free on {{ mirror_install_path }}
+      shell: set -o pipefail && df -PBG '{{ mirror_install_path }}' | awk 'FNR == 2 {print ($4+1)}'
+      register: df_apps
+      failed_when: df_apps.stdout|int < 200
+      changed_when: False
+
+    - name: Register and subscribe RedHat system to related pools.
+      redhat_subscription:
+        state: present
+        username: "{{ Username }}"
+        password: "{{ Password }}"
+        pool_ids: "{{ redhat_pool_ids }}"
+
+    - name: Enable repositories for Redhat 7 which will be synced
+      rhsm_repository:
+        state: enabled
+        name:
+          - rhel-7-server-rpms
+          - rhel-7-server-optional-rpms
+          - rhel-7-server-extras-rpms
+
+    - name: Uninstall Spacewalk related packages if any
+      yum:
+        name:
+         - osad
+         - rhncfg-actions
+        state: absent
+
+    - name: Create directory for repo backups
+      file:
+        path: /etc/yum.repos.d/old/before_mirror/
+        state: directory
+
+    - name: Remove old repofiles which contain Spacewalk in content
+      shell: find /etc/yum.repos.d/ -maxdepth 1 -type f -exec grep -il "Spacewalk" {} \; \
+             -exec mv {} /etc/yum.repos.d/old/before_mirror/   \;
+      changed_when: False
+
+    - name: Install needed packages
+      yum:
+        name:
+         - yum-utils
+         - createrepo
+         - httpd
+         - policycoreutils-python
+        state: present
+
+    - name: Create directory {{ mirror_install_path }}/repo
+      file:
+        state: directory
+        mode: g+s
+        owner: apache
+        group: apache
+        path: "{{ mirror_install_path }}/repo/rhel7"
+
+    - name: Create directory /root/SCRIPTS for crontab scripts
+      file:
+        state: directory
+        path: "/root/SCRIPTS"
+
+    - name: Create a symbolic link {{ mirror_install_path }}/repo --> /var/www/html/repo
+      file:
+        src: "{{ mirror_install_path }}/repo"
+        dest: /var/www/html/repo
+        state: link
+
+    - name: Allow apache to modify files in {{ mirror_install_path }}/repo
+      sefcontext:
+        target: '{{ mirror_install_path }}/repo(/.*)?'
+        setype: httpd_sys_rw_content_t
+        state: present
+      register: selinux_action
+      notify: Apply new SELinux file context to repo path
+
+    - name: Creating index.html with redirect to /repo
+      copy:
+        dest: "/var/www/html/index.html"
+        mode: '0644'
+        content: |
+          <!DOCTYPE html>
+          <html>
+             <head>
+                <title>Red Hat rpm mirror</title>
+                <meta http-equiv = "refresh" content = "2; url = /repo" />
+             </head>
+             <body>
+                <p>Redirect for about 2s...</p>
+             </body>
+          </html>
+
+    - name: Allow http on firewalld (if running)
+      firewalld:
+        service: http
+        permanent: yes
+        state: enabled
+        immediate: yes
+      failed_when: false
+
+    - name: Start and enable service httpd
+      service:
+        name: httpd
+        state: started
+        enabled: yes
+
+    - name: Creating a script for crontab usage for Red Hat packages
+      copy:
+        dest: "/root/SCRIPTS/reposync-mirror.sh"
+        mode: '0755'
+        content: |
+           #!/bin/bash
+           echo '****************************************************************************************'
+           echo "$(date '+%F %T') START REDHAT 7 SYNC ***************************************************"
+           yum clean all
+           yum list-sec
+           for i in $(yum repolist | awk 'NR>2 {print $1}' | grep -v 'repolist:'| cut -d '/' -f1 | xargs) ; do
+             echo "Syncing ${i} start @$(date '+%F %T') -------------------------"
+             reposync --gpgcheck -l --repoid=${i} --download_path=/var/www/html/repo/rhel7/ --downloadcomps --download-metadata
+             cd /var/www/html/repo/rhel7/${i}
+             createrepo -v /var/www/html/repo/rhel7/${i} -g comps.xml
+             find /var/cache/yum/x86_64/7Server/${i}/ -name updateinfo.xml -exec cp -p {} /var/www/html/repo/rhel7/${i}/repodata/updateinfo.xml \;
+             modifyrepo /var/www/html/repo/rhel7/${i}/repodata/updateinfo.xml /var/www/html/repo/rhel7/${i}/repodata
+           done
+           echo "$(date '+%F %T') END *******************************************************************"
+           exit 0
+
+    - name: Setup cronjob for Redhat packages
+      cron:
+        name: "Synchronize Red Hat packages"
+        minute: "0"
+        hour: "3"
+        weekday: "3"
+        job: "/root/SCRIPTS/reposync-mirror.sh &>> /var/log/reposync-mirror.log"
+
+    - name: Creating logrotate rule for /var/log/reposync-mirror.log
+      copy:
+        dest: "/etc/logrotate.d/reposync-mirror-log"
+        mode: '0644'
+        content: |
+          /var/log/reposync-mirror.log {
+            monthly
+            missingok
+            rotate 6
+            compress
+            dateext
+            notifempty
+            copytruncate
+          }
