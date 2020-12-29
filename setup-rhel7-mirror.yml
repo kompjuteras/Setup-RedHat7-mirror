@@ -4,7 +4,6 @@
   become_user: root
   become_method: sudo
   ignore_errors: false
-  any_errors_fatal: true
 
   vars:
     # Setup subscription pool(s) which you want to attach to your machine
@@ -28,6 +27,16 @@
       command: restorecon -R {{ mirror_install_path }}/repo
 
   tasks:
+
+    - name: Checj is system supported (Red Hat 7 only)
+      debug:
+        msg: "{{ ansible_distribution }} {{ ansible_distribution_version }} is not supported OS for this play"
+      failed_when: >
+        ansible_distribution != "RedHat" or
+        ( ansible_distribution == "RedHat" and ansible_distribution_major_version|int != 7 )
+      when: 
+        ansible_distribution != "RedHat" or
+        ( ansible_distribution == "RedHat" and ansible_distribution_major_version|int != 7 )
 
     - name: Check is https://cdn.redhat.com visible from the server
       shell: timeout 10 curl -I https://cdn.redhat.com --insecure &>/dev/null
